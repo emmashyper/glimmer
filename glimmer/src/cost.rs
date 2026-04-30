@@ -1,14 +1,13 @@
 //! Estimated function cost from LuaJIT bytecode (`CONTEXT.md`).
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::{c_void, CString};
+use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
 use std::path::Path;
 
 use glimmer_luajit_sys::*;
 
 use crate::bc::{self, op};
-
-const LUA_OK: i32 = 0;
+use crate::chunk::{self, load_chunk};
 
 /// Extra weight on top of the uniform base (v1 tuning).
 const HOT_EXTRA: i64 = 2;
@@ -18,6 +17,8 @@ const LOOKBACK_FOR_FNEW: usize = 48;
 
 #[derive(Debug, Clone)]
 pub struct ProtoCost {
+    /// Best-effort name from source (`(main)` for the chunk closure, or `(anonymous @ line N)`).
+    pub name: String,
     pub first_line: u32,
     pub num_lines: u32,
     pub intrinsic: i64,
@@ -30,6 +31,68 @@ pub struct FileCostReport {
     pub path: String,
     pub protos: Vec<ProtoCost>,
     pub load_error: Option<String>,
+}
+
+fn simple_lua_name(token: &str) -> bool {
+    let mut ch = token.chars();
+    let Some(c) = ch.next() else {
+        return false;
+    };
+    if !(c.is_ascii_alphabetic() || c == '_') {
+        return false;
+    }
+    ch.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Parse `local function foo`, `function foo`, `foo = function` on `line_1based` (Lua line numbers).
+fn guess_lua_function_name(source: &str, line_1based: u32) -> Option<String> {
+    let idx = line_1based.saturating_sub(1) as usize;
+    let line = source.lines().nth(idx)?;
+    let s = line.trim_start();
+
+    if let Some(rest) = s.strip_prefix("local") {
+        let rest = rest.trim_start();
+        if let Some(rest) = rest.strip_prefix("function") {
+            let rest = rest.trim_start();
+            let end = rest.find(|c: char| c == '(' || c.is_whitespace())?;
+            let name = rest[..end].trim();
+            if simple_lua_name(name) {
+                return Some(name.to_string());
+            }
+        }
+    }
+
+    if let Some(rest) = s.strip_prefix("function") {
+        let rest = rest.trim_start();
+        let end = rest.find('(')?;
+        let name = rest[..end].trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+
+    if let Some(eq_pos) = s.find('=') {
+        let left = s[..eq_pos].trim_end();
+        let right = s[eq_pos + 1..].trim_start();
+        if right.starts_with("function") && simple_lua_name(left.trim()) {
+            return Some(left.trim().to_string());
+        }
+    }
+
+    None
+}
+
+pub(crate) fn proto_display_name(
+    proto: *const c_void,
+    chunk_proto: *const c_void,
+    source: &str,
+    line: u32,
+) -> String {
+    if proto == chunk_proto {
+        return "(main)".to_string();
+    }
+    guess_lua_function_name(source, line)
+        .unwrap_or_else(|| format!("(anonymous @ line {})", line))
 }
 
 fn is_hot_opcode(opc: u8) -> bool {
@@ -93,41 +156,6 @@ fn is_call_site_opcode(opc: u8) -> bool {
     )
 }
 
-unsafe fn proto_insns(pt: *const c_void) -> Vec<u32> {
-    let n = glimmer_proto_sizebc(pt) as usize;
-    let p = glimmer_proto_bc(pt);
-    if p.is_null() || n == 0 {
-        return Vec::new();
-    }
-    std::slice::from_raw_parts(p, n).to_vec()
-}
-
-fn collect_protos(root: *const c_void) -> Vec<*const c_void> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    let mut q = VecDeque::new();
-    if root.is_null() {
-        return out;
-    }
-    q.push_back(root);
-    while let Some(p) = q.pop_front() {
-        let id = p as usize;
-        if !seen.insert(id) {
-            continue;
-        }
-        out.push(p);
-        let nkgc = unsafe { glimmer_proto_sizekgc(p) };
-        for j in 1..=nkgc {
-            let kidx = -(j as isize);
-            let child = unsafe { glimmer_proto_kgc_proto_at(p, kidx) };
-            if !child.is_null() {
-                q.push_back(child);
-            }
-        }
-    }
-    out
-}
-
 fn intrinsic_score(insns: &[u32]) -> i64 {
     let mut total = 0i64;
     for ins in insns {
@@ -161,7 +189,7 @@ fn build_parent_and_fnew_slots(
     let mut fnew_slot = HashMap::new();
     let ids: HashSet<usize> = protos.iter().map(|p| *p as usize).collect();
     for &p in protos {
-        let insns = unsafe { proto_insns(p) };
+        let insns = unsafe { chunk::proto_bc_words(p) };
         for ins in &insns {
             if bc::bc_op(*ins) != op::FNEW {
                 continue;
@@ -312,89 +340,46 @@ fn transitive_from_root(
 
 /// Analyze a UTF-8 Lua source file. Uses a fresh `lua_State` per call.
 pub fn cost_file(path: &Path) -> FileCostReport {
-    let path_str = path.to_string_lossy().into_owned();
-    let src = match std::fs::read(path) {
-        Ok(b) => b,
+    let loaded = match load_chunk(path) {
+        Ok(c) => c,
         Err(e) => {
             return FileCostReport {
-                path: path_str,
+                path: path.to_string_lossy().into_owned(),
                 protos: Vec::new(),
-                load_error: Some(format!("read error: {e}")),
+                load_error: Some(e),
             };
         }
     };
 
+    let path_str = loaded.path.clone();
+    let root = loaded.root_proto;
+    let source_text = loaded.source_text.as_str();
+    let protos = &loaded.protos;
+
     unsafe {
-        let l = luaL_newstate();
-        if l.is_null() {
-            return FileCostReport {
-                path: path_str,
-                protos: Vec::new(),
-                load_error: Some("luaL_newstate returned null".into()),
-            };
-        }
-        luaL_openlibs(l);
-        let name = CString::new(path_str.as_str()).unwrap_or_else(|_| CString::new("=(glimmer)").unwrap());
-        let chunk = match CString::new(src.as_slice()) {
-            Ok(c) => c,
-            Err(_) => {
-                lua_close(l);
-                return FileCostReport {
-                    path: path_str,
-                    protos: Vec::new(),
-                    load_error: Some("source contains interior NUL byte".into()),
-                };
-            }
-        };
-
-        let st = luaL_loadbuffer(
-            l,
-            chunk.as_ptr(),
-            chunk.as_bytes().len(),
-            name.as_ptr(),
-        );
-        if st != LUA_OK {
-            lua_close(l);
-            return FileCostReport {
-                path: path_str,
-                protos: Vec::new(),
-                load_error: Some(format!("luaL_loadbuffer failed with status {st}")),
-            };
-        }
-
-        let closure = lua_topointer(l, -1);
-        if closure.is_null() || glimmer_is_lua_closure(closure) == 0 {
-            lua_close(l);
-            return FileCostReport {
-                path: path_str,
-                protos: Vec::new(),
-                load_error: Some("loaded value is not a Lua closure".into()),
-            };
-        }
-
-        let root = glimmer_closure_proto(closure);
-        let protos = collect_protos(root);
         let proto_ids: HashSet<usize> = protos.iter().map(|p| *p as usize).collect();
-        let (parent, fnew_slot) = build_parent_and_fnew_slots(&protos);
+        let (parent, fnew_slot) = build_parent_and_fnew_slots(protos);
 
         let mut intrinsic_map: HashMap<usize, i64> = HashMap::new();
         let mut unresolved_map: HashMap<usize, u32> = HashMap::new();
         let mut adj: HashMap<usize, Vec<*const c_void>> = HashMap::new();
 
-        for &p in &protos {
-            let insns = proto_insns(p);
+        for &p in protos.iter() {
+            let insns = chunk::proto_bc_words(p);
             intrinsic_map.insert(p as usize, intrinsic_score(&insns));
             let (edges, ur) =
-                build_callee_edges(p, &insns, &proto_ids, &parent, &fnew_slot, &protos);
+                build_callee_edges(p, &insns, &proto_ids, &parent, &fnew_slot, protos);
             unresolved_map.insert(p as usize, ur);
             adj.insert(p as usize, edges);
         }
 
         let mut report = Vec::new();
-        for &p in &protos {
+        for &p in protos.iter() {
             let tr = transitive_from_root(p, &intrinsic_map, &adj);
+            let first_line = glimmer_proto_firstline(p);
             report.push(ProtoCost {
-                first_line: glimmer_proto_firstline(p),
+                name: proto_display_name(p, root, source_text, first_line),
+                first_line,
                 num_lines: glimmer_proto_numline(p),
                 intrinsic: *intrinsic_map.get(&(p as usize)).unwrap_or(&0),
                 transitive: tr,
@@ -402,9 +387,9 @@ pub fn cost_file(path: &Path) -> FileCostReport {
             });
         }
 
-        report.sort_by_key(|r| (r.first_line, r.num_lines));
-
-        lua_close(l);
+        report.sort_by(|a, b| {
+            (a.first_line, a.num_lines, &a.name).cmp(&(b.first_line, b.num_lines, &b.name))
+        });
 
         FileCostReport {
             path: path_str,

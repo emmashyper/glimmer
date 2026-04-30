@@ -55,10 +55,11 @@ LuaJIT 2.1.x | Lua 5.1
 
 # Project Goals:
 
-- [ ] Compiles code using luajit for bytecode analysis.
-- [ ] Estimated function cost of execution.
-- [ ] Can this code be JIT compiled, if not, why?
+- [x] Compiles code using luajit for bytecode analysis.
+- [x] Estimated function cost of execution.
+- [x] Can this code be JIT compiled, if not, why?
 - [ ] Provide type information via NDoc comments.
 - [ ] lua-lint levels of linting.
 - [ ] Bytecode warnings.
 - [ ] Performance lints.
+- [ ] Tiny Bytecode Executor. With source maps.
