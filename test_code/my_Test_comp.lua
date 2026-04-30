@@ -20,13 +20,16 @@ end
 __p1 = function()
   local _r0, _r1
   _r0 = 1
-  if not (_r0 == 1) then
+  if _r0 == 1 then
     goto __p1_x0
+  else
+    goto __p1_x1
   end
+  ::__p1_x0::
   _r0 = _G["print"]
   _r1 = "Easy example"
-  ::__p1_x0::
   _r0(_r1)
+  ::__p1_x1::
   return
 end
 __p2 = function()
@@ -35,53 +38,53 @@ __p2 = function()
   while true do
     if __dc_2 == 0 then
       _r0 = 1
-      if not (_r0 == 1) then
-        __dc_2 = 2
-      else
+      if _r0 == 1 then
         __dc_2 = 1
+      else
+        __dc_2 = 2
       end
     elseif __dc_2 == 1 then
       _r0 = _G["print"]
       _r1 = "High example"
+      _r0(_r1)
       __dc_2 = 2
     elseif __dc_2 == 2 then
-      _r0(_r1)
       _r0 = 2
-      if not (_r0 == 2) then
-        __dc_2 = 4
-      else
+      if _r0 == 2 then
         __dc_2 = 3
+      else
+        __dc_2 = 4
       end
     elseif __dc_2 == 3 then
       _r0 = _G["print"]
       _r1 = "High example 2"
+      _r0(_r1)
       __dc_2 = 4
     elseif __dc_2 == 4 then
-      _r0(_r1)
       _r0 = 3
-      if not (_r0 == 3) then
-        __dc_2 = 6
-      else
+      if _r0 == 3 then
         __dc_2 = 5
+      else
+        __dc_2 = 6
       end
     elseif __dc_2 == 5 then
       _r0 = _G["print"]
       _r1 = "High example 3"
+      _r0(_r1)
       __dc_2 = 6
     elseif __dc_2 == 6 then
-      _r0(_r1)
       _r0 = 3
-      if not (_r0 == 4) then
-        __dc_2 = 8
-      else
+      if _r0 == 4 then
         __dc_2 = 7
+      else
+        __dc_2 = 8
       end
     elseif __dc_2 == 7 then
       _r0 = _G["print"]
       _r1 = "High example 4"
+      _r0(_r1)
       __dc_2 = 8
     elseif __dc_2 == 8 then
-      _r0(_r1)
       return
     elseif __dc_2 == 102000 then
       local __ph_2_0 = nil

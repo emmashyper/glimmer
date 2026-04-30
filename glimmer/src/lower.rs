@@ -48,12 +48,17 @@ fn uv_name(i: u32) -> String {
     format!("_u{}", i)
 }
 
-/// Resolved 1-based target PC for `BC_JMP` / `BC_UCLO` / other `AJ` branches.
-/// The high half stores an **unsigned** displacement; `bc_j` is `(ptrdiff_t)bc_d(ins) - BCBIAS_J`.
-/// Casting that half to `i16` first breaks forward targets ≥ 0x8000 (e.g. `+1` encodes as `0x8001`).
+/// Resolved **1-based** destination PC for `BC_JMP` / `BC_UCLO` / fused-compare branch slots.
+///
+/// LuaJIT stores `setbc_d(jmp, dest - (jmp_pc0 + 1) + BCBIAS_J)` with **0-based** `jmp_pc0`
+/// (`lj_parse.c:jmp_patchins`). So `dest0 = jmp_pc0 + 1 + (bc_d - BCBIAS_J)`.
+/// Glimmer uses **1-based** `pc` (= `jmp_pc0 + 1`), hence `dest1 = pc + (bc_d - BCBIAS_J) + 1`.
+///
+/// The high half is stored as **unsigned** 16-bit; do not narrow through `i16` first (e.g. `+1`
+/// encodes as `0x8001`).
 fn jmp_target_pc(pc: i32, ins: u32) -> i32 {
     let rd = (ins >> 16) & 0xffff;
-    pc + rd as i32 - BCBIAS_J
+    pc + rd as i32 - BCBIAS_J + 1
 }
 
 /// PCs that are the destination of `BC_JMP` or `BC_UCLO` in this proto (1-based bytecode index).
@@ -67,6 +72,12 @@ fn collect_proto_jump_targets(bc: &[u32], sizebc: i32) -> HashSet<i32> {
             let tgt = jmp_target_pc(pc, ins);
             if (1..=sizebc).contains(&tgt) {
                 targets.insert(tgt);
+            }
+        } else if (4..=11).contains(&op) {
+            // Then-entry is only reached by fallthrough past the JMP slot; it may not be a JMP target.
+            let then_pc = pc + 2;
+            if (1..=sizebc).contains(&then_pc) {
+                targets.insert(then_pc);
             }
         }
         pc += 1;

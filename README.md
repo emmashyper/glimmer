@@ -60,6 +60,6 @@ LuaJIT 2.1.x | Lua 5.1
 - [x] Can this code be JIT compiled, if not, why?
 - [ ] Provide type information via NDoc comments.
 - [ ] lua-lint levels of linting.
-- [ ] Bytecode warnings.
+- [x] Bytecode warnings.
 - [ ] Performance lints.
-- [ ] Tiny Bytecode Executor. With source maps.
+- [x] Tiny Bytecode Executor. With source maps.

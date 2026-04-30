@@ -154,21 +154,21 @@ fn is_eq_family_comparison(op: u8) -> bool {
     (4..=11).contains(&op)
 }
 
-/// Lua condition that when **true** follows the VM branch (taken `BC_JMP` at `cmp_pc + 1`).
-fn lua_comparison_condition(op: u8, pt: *const std::ffi::c_void, ins: u32) -> Result<String, String> {
+/// Equality/inequality subexpression for `ISEQV`…`ISNEP` (`a == rhs` as in the VM, before `if` inversion).
+fn lua_eq_family_expr(op: u8, pt: *const std::ffi::c_void, ins: u32) -> Result<String, String> {
     let a = reg(bc_a(ins));
-    let eq_expr = match op {
+    match op {
         4 | 5 => {
             let rb = reg(s16(bc_d(ins)) as u8);
-            format!("{} == {}", a, rb)
+            Ok(format!("{} == {}", a, rb))
         }
         6 | 7 => {
             let lit = unsafe { kgc_string_lua_literal(pt, ins)? };
-            format!("{} == {}", a, lit)
+            Ok(format!("{} == {}", a, lit))
         }
         8 | 9 => {
             let kl = unsafe { knum_literal(pt, bc_d(ins))? };
-            format!("{} == {}", a, kl)
+            Ok(format!("{} == {}", a, kl))
         }
         10 | 11 => {
             let v = match bc_d(ins) & 0xffff {
@@ -177,18 +177,28 @@ fn lua_comparison_condition(op: u8, pt: *const std::ffi::c_void, ins: u32) -> Re
                 2 => "true",
                 _ => return Err(format!("ISEQP/ISNEP unknown pri {}", bc_d(ins))),
             };
-            format!("{} == {}", a, v)
+            Ok(format!("{} == {}", a, v))
         }
-        _ => return Err(format!("lua_comparison_condition: op {}", op)),
-    };
-    Ok(if matches!(op, 4 | 6 | 8 | 10) {
-        eq_expr
+        _ => Err(format!("lua_eq_family_expr: op {}", op)),
+    }
+}
+
+/// Lua condition that when **true** matches the VM path into the **then** body at `cmp_pc + 2`
+/// (fallthrough after the fused compare consumes the following `BC_JMP` without taking its offset).
+/// After `bcemit_branch_t`, `if x == y` is emitted as `ISN*`; `if x ~= y` as `IS*`.
+fn lua_if_jmp_then_cond(op: u8, pt: *const std::ffi::c_void, ins: u32) -> Result<String, String> {
+    let eq = lua_eq_family_expr(op, pt, ins)?;
+    Ok(if op % 2 == 1 {
+        eq
     } else {
-        format!("not ({})", eq_expr)
+        format!("not ({})", eq)
     })
 }
 
-fn jmp_target_after_comparison(
+/// Target PC when the fused compare takes **`branchPC`** using the following slot’s displacement
+/// (Lua “skip then” / false path). Not to be confused with the compare insn’s `D` operand
+/// (`knum` / `kgc` / second reg for `ISEQN`…`ISNEP`).
+fn jmp_skip_then_after_comparison(
     bc: &[u32],
     cmp_pc: i32,
     sizebc: i32,
@@ -228,23 +238,37 @@ fn emit_comparison_jmp_pair(
     let ins = bc[(cmp_pc - 1) as usize];
     let op = bc_op(ins);
     debug_assert!(is_eq_family_comparison(op));
-    let cond = lua_comparison_condition(op, pt, ins)?;
-    let jmp_tgt = jmp_target_after_comparison(bc, cmp_pc, sizebc, proto_id)?;
-    let fall_pc = cmp_pc + 2;
+    let cond = lua_if_jmp_then_cond(op, pt, ins)?;
+    let jmp_then_pc = cmp_pc + 2;
+    if jmp_then_pc > sizebc {
+        return Err(format!(
+            "proto {} pc {}: then-entry pc {} past sizebc {}",
+            proto_id, cmp_pc, jmp_then_pc, sizebc
+        ));
+    }
+    let skip_then_pc = jmp_skip_then_after_comparison(bc, cmp_pc, sizebc, proto_id)?;
     match branch {
         BranchStyle::Linear {
             target_labels,
             sizebc: sb,
             proto_id: pid,
         } => {
-            let lbl = target_labels.get(&jmp_tgt).ok_or_else(|| {
+            let lbl_then = target_labels.get(&jmp_then_pc).ok_or_else(|| {
                 format!(
-                    "proto {} pc {}: comparison branch target pc {} has no label (sizebc={})",
-                    pid, cmp_pc, jmp_tgt, *sb
+                    "proto {} pc {}: linear lowering missing `then` label for pc {} (sizebc={})",
+                    pid, cmp_pc, jmp_then_pc, *sb
+                )
+            })?;
+            let lbl_skip = target_labels.get(&skip_then_pc).ok_or_else(|| {
+                format!(
+                    "proto {} pc {}: linear lowering missing skip label for pc {} (sizebc={})",
+                    pid, cmp_pc, skip_then_pc, *sb
                 )
             })?;
             emitln!(out, "{}if {} then", indent, cond)?;
-            emitln!(out, "{}  goto {}", indent, lbl)?;
+            emitln!(out, "{}  goto {}", indent, lbl_then)?;
+            emitln!(out, "{}else", indent)?;
+            emitln!(out, "{}  goto {}", indent, lbl_skip)?;
             emitln!(out, "{}end", indent)?;
         }
         BranchStyle::Dispatcher {
@@ -253,22 +277,22 @@ fn emit_comparison_jmp_pair(
             sizebc: sb,
             proto_id: pid,
         } => {
-            if fall_pc > *sb {
+            if !(1..=*sb).contains(&skip_then_pc) {
                 return Err(format!(
-                    "proto {} pc {}: comparison fallthrough pc {} past sizebc {}",
-                    pid, cmp_pc, fall_pc, *sb
+                    "proto {} pc {}: comparison false-branch pc {} out of range sizebc {}",
+                    pid, cmp_pc, skip_then_pc, *sb
                 ));
             }
-            let bt = pc_to_block.get(&jmp_tgt).copied().ok_or_else(|| {
+            let bt = pc_to_block.get(&jmp_then_pc).copied().ok_or_else(|| {
                 format!(
-                    "proto {} pc {}: dispatcher missing jmp target pc {}",
-                    pid, cmp_pc, jmp_tgt
+                    "proto {} pc {}: dispatcher missing jmp-then pc {}",
+                    pid, cmp_pc, jmp_then_pc
                 )
             })?;
-            let bf = pc_to_block.get(&fall_pc).copied().ok_or_else(|| {
+            let bf = pc_to_block.get(&skip_then_pc).copied().ok_or_else(|| {
                 format!(
-                    "proto {} pc {}: dispatcher missing fallthrough pc {}",
-                    pid, cmp_pc, fall_pc
+                    "proto {} pc {}: dispatcher missing skip-then pc {}",
+                    pid, cmp_pc, skip_then_pc
                 )
             })?;
             emitln!(out, "{}if {} then", indent, cond)?;
