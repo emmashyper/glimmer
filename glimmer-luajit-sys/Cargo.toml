@@ -1,0 +1,11 @@
+[package]
+name = "glimmer-luajit-sys"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+links = "lua51"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1.2"
